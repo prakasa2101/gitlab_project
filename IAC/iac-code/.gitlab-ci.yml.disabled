@@ -1,0 +1,179 @@
+## Initial pipeline to verify and deploy Terraform Code
+
+include:
+  - /.base.yml
+
+
+stages:
+  - Code Validation
+  - Terraform PLAN
+  - Terraform APPLY
+
+
+# Parallel set for Stages
+.parallel_config:
+  parallel:
+    matrix:
+      - AWS_ACCOUNT: [dev, qa, stage]
+
+
+###
+# Checkov Security Scanner
+###   
+chekov-code-scan:
+  stage: Code Validation
+  allow_failure: true  
+  tags:
+    - $IAC_RUNNER  
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+      exists:
+        - '**/*.json'
+        - '**/*.tpl'
+        - '**/*.tf'      
+  script:
+    - checkov -d . -o junitxml --download-external-modules false --quiet --soft-fail | tee checkov.test.xml
+  artifacts:
+    reports:
+      junit: "checkov.test.xml"
+    paths:
+      - "checkov.test.xml"  
+
+
+###
+# Terraform Validate / per Stage
+###    
+Terraform-Validate:
+  extends: 
+    - .worker_image
+  stage: Code Validation
+  parallel: !reference [.parallel_config, parallel]
+  tags:
+     - $AWS_ACCOUNT 
+     - $IAC_RUNNER
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_FORCE_HTTPS: "true"
+    GIT_SUBMODULE_UPDATE_FLAGS: --remote  
+  script:
+    - eval $(aws sts assume-role --role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/terraform-executor --role-session-name terraform-run-${AWS_ACCOUNT}-$CI_PIPELINE_ID | jq -r '.Credentials | "export AWS_ACCESS_KEY_ID=\(.AccessKeyId)\nexport AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)\nexport AWS_SESSION_TOKEN=\(.SessionToken)\n"')
+    - echo "Validate ${AWS_ACCOUNT^^}" 
+    - cd ${AWS_ACCOUNT^^}
+    - terraform init --lock=false
+    - terraform validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'   
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      allow_failure: false      
+
+
+###
+# Terraform Docs / per Stage
+###
+Terraform-Docs-FMT:
+  image:
+    name: $$IAC_IMAGE_$AWS_ACCOUNT
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  stage: Code Validation
+  tags:
+     - $AWS_ACCOUNT 
+     - $IAC_RUNNER
+  variables:
+    AWS_ACCOUNT: dev
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_FORCE_HTTPS: "true"
+    GIT_SUBMODULE_UPDATE_FLAGS: --remote  
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+      variables:
+        BRANCH_NAME: ${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}
+      allow_failure: false
+  script:
+    - eval $(aws sts assume-role --role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/terraform-executor --role-session-name terraform-run-${AWS_ACCOUNT}-$CI_PIPELINE_ID | jq -r '.Credentials | "export AWS_ACCESS_KEY_ID=\(.AccessKeyId)\nexport AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)\nexport AWS_SESSION_TOKEN=\(.SessionToken)\n"')
+    - echo "Generate docs for all stages"
+    - ls -1 -d */ | grep -v "tf-modules" | while read stage; do terraform fmt $stage/ ;  terraform-docs markdown table --output-file README.md --output-mode inject ./$stage ; done
+    - git config --global user.name "${GITLAB_USER_NAME}"
+    - git config --global user.email "${GITLAB_USER_EMAIL}"
+    - git add .
+    - git commit -am "Auto documentation update $CI_COMMIT_SHORT_SHA" || true
+    - git push https://$CI_PROJECT_NAME:$CI_PROJECT_TOKEN@gitlab.com/opt-med-tech/iac/iac-code.git "HEAD:${BRANCH_NAME}" -o ci.skip
+
+
+
+#### ---- Deploy Terraform ----------------
+###
+### Terraform PLAN
+###
+plan DEV:
+  extends: 
+    - .worker_image
+    - .plan
+  variables:
+    AWS_ACCOUNT: dev
+  needs:
+    - job: Terraform-Validate
+      parallel:
+        matrix:
+          - AWS_ACCOUNT: [dev]  
+
+plan QA:
+  extends: 
+    - .worker_image
+    - .plan
+  variables:
+    AWS_ACCOUNT: qa
+  needs:
+    - job: Terraform-Validate
+      parallel:
+        matrix:
+          - AWS_ACCOUNT: [qa]  
+
+plan STAGE:
+  extends: 
+    - .worker_image
+    - .plan    
+  variables:
+    AWS_ACCOUNT: stage
+  needs:
+    - job: Terraform-Validate
+      parallel:
+        matrix:
+          - AWS_ACCOUNT: [stage]  
+
+
+###
+### Terraform APPLY
+###
+apply DEV:
+  variables:
+    AWS_ACCOUNT: dev
+  extends: 
+    - .worker_image
+    - .apply    
+  needs: ["plan DEV"]
+
+apply QA:
+  variables:
+    AWS_ACCOUNT: qa
+  extends: 
+    - .worker_image
+    - .apply    
+  needs: ["plan QA"]
+
+apply STAGE:
+  variables:
+    AWS_ACCOUNT: stage  
+  extends: 
+    - .worker_image
+    - .apply    
+  needs: ["plan STAGE"]

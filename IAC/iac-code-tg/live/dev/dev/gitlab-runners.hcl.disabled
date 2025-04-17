@@ -1,0 +1,45 @@
+# Include config from root terragrunt.hcl
+include "root" {
+  path = find_in_parent_folders()
+}
+
+# Set module source
+terraform {
+  source = "../../../../modules/gitlab-runners"
+}
+
+# Set module dependencies
+dependency "vpc" {
+  config_path = "../../common/vpc"
+}
+
+
+
+# Set local vars from tfvars file
+locals {
+  common_tfvars = jsondecode(read_tfvars_file("../../common.tfvars"))
+}
+
+# Input values to use for the variables of the module
+inputs = {
+  environment     = local.common_tfvars.environment
+  s3_state_bucket = local.common_tfvars.s3_state_bucket
+  vpc_id          = dependency.vpc.outputs.vpc_id
+  private_subnets = dependency.vpc.outputs.private_subnets
+
+
+
+  # IAC runner
+  iac_runner_min_size         = 0
+  iac_runner_max_size         = 1
+  iac_runner_desired_capacity = 0
+  iac_concurrent_jobs         = 10
+
+  ### Init
+  # init_token_bakery = ""
+}
+
+
+
+
+

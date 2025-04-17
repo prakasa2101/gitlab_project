@@ -1,0 +1,271 @@
+stages:
+  - lint
+  - test
+  - build
+  - build-verify
+  - deploy
+  - deploy-protected
+
+include:
+  - template: Jobs/Dependency-scannling.gitlab-ci.yml
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  - template: Jobs/Container-Scanning.gitlab-ci.yml
+
+# Extended Job Definitions
+
+.tags: &runner-tags
+  - sequel_backend_runner
+  - dev
+
+.common-job:
+  rules: &common-job-rules
+    - if: $CI_COMMIT_BRANCH == 'main'
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST
+
+.universal-job:
+  rules: &universal-job-rules
+    - if: $CI_COMMIT_BRANCH == 'main'
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+
+.draft-only:
+  rules: &draft-only-rules
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^Draft:/
+
+.story-job:
+  rules:  &story-job-rules
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+
+.main-job:
+  rules: &main-job-rules
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+# Extended Imports
+# Extend and override the imported jobs first
+# This allows setting of rules as well as changing what stag they executed
+
+gemnasium-dependency_scannling:
+  rules: *common-job-rules
+
+semgrep-sast:
+  rules: *common-job-rules
+
+secret_detection:
+  rules: *common-job-rules
+
+# stage: build-verify
+
+container_scanning:
+  rules: *main-job-rules
+  stage: build-verify
+  varibles:
+    CS_IMAGE: $CI_REGISTRY/$CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA
+
+# stage: lint
+
+lint:
+  rules: *universal-job-rules
+  image: node:tls
+  stage: lint
+  artifacts:
+    when: always
+    paths:
+      - reports/*
+  script:
+    - mkdir -p reports
+    - echo "TODO -- Add eslint"
+    - npm ci --no-cache
+    - npm run lint | tee reports/lint-backend.txt
+
+.db-test-vars: &db-test-vars
+   POSTGRES_DB: sequel_test
+   POSTGRES_USER: postgres
+   POSTGRES_PASSWORD: pass
+   NEW_ENVIRONMENT: true
+   NODE_ENV: test
+
+db-lint:
+  rules: *story-job-rules
+  image: node:tls
+  stage: lint
+  services: &db-test-services
+    - name: postgres:15.5-alpine
+      alias: db-test
+  variables:
+    <<: *db-test-vars
+    GIT_STRATEGY: clone
+  before_script: &db-test-before-script
+    - export DB_HOST=db-test
+    - export DB_PORT=5432
+    - export DB_USERNAME=$POSTGRES_USER
+    - export DB_PASSWORD=$POTGRES_PASSWORD
+    - export DB_NAME=$POSTGRES_DB
+    - curl -sSf https://atlasgo.sh | sh
+  script:
+    - git fetch origin main
+    - npm ci --no-cache
+    - npm run db:lint
+
+db-check-migrations:
+  rules: *story-job-rules
+  image: node:lts
+  stage: lint
+  services: *db-test-services
+  variables: *db-test-vars
+  before_script: *db-test-before-script
+  script:
+    - npm ci --no-cache
+    - CHECKSUM_BEFORE=$(md5sum migrations/atlas.sum | awk '{ print $1 }')
+    - npm run db:make
+    - CHECKSUM_AFTER=$(md5sum migrations/atlas.sum | awk '{ print $1 }')
+    - |
+      if [ "$CHECKSUM_BEFORE" != "$CHECKSUM_AFTER" ]; then
+        echo "New migration changes detected. Please review and commit the"
+        exit 1
+      else
+        echo "No New migration changes detected"
+      fi
+
+draft-check:
+  rules: *draft-only-rules
+  stage: lint
+  needs:
+    - lint
+    - db-lint
+    - db-check-migrations
+  script:
+    - echo "Draft pipeline! Please run new pipeline with MR ready for review"
+    - exit 1
+
+# Stage: test
+
+test-unit:
+  rules: *common-job-rules
+  image: node:lts
+  stage: test
+  tags: *runner-tags
+  services: *db-test-services
+  variables: *db-test-vars
+  before_script: *db-test-before-script
+  artifacts:
+    when: always
+    reports:
+      junit: reports/junit.xml
+    paths:
+      - reports/*
+      - coverage-unit/*
+    script:
+      - mkdir -p reports
+      - npm ci --no-cache
+      - npm run test:setup
+      - npm run test:unit:ci | tee reports/test-unit-backend.txt
+      - mv coverage coverage-unit
+    
+test-e2e:
+  rules: *common-job-rules
+  image: node-lts
+  stage: test
+  tags: *runner-tags
+  services: *db-test-services
+  variables: *db-test-vars
+  before_script: *db-test-before-script
+  artifacts:
+    when: always
+    reports:
+      junit: reports/junit.xml
+    paths:
+      - reports/*
+      - coverage-e2e/*
+  script:
+    - mkdir -p reports
+    - npm ci --no-cache
+    - npm run test:setup
+    - npm run test:e2e:ci | tee reports/test-e2e-backend.txt
+    - mv coverage coverage-e2e
+sonarcloud-check:
+  rules: *common-job-rules
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: ['']
+  variables:
+    SONAR_USER_HOME: '${CI_PROJECT_DIR}/.sonar'
+    GIT_DEPTH: '0'
+  cache:
+    key: '${CI_JOB_NAME}'
+    paths:
+      - .sonar/cache
+  needs:
+    - job: test-unit
+    - job: test-e2e
+  script:
+    - sonar-scanner
+  
+# Stage: build
+
+build-image:
+  rules: *main-job-rules
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build --build-arg GIT_SHA=$CI_COMMIT_SHORT_SHA
+      -t $CI_REGISTRY/$CI_PROJECT_PATH:latest
+      -t $CI_REGISTRY/$CI_PROJECT_PATH:dev
+      -t $CI_REGISTRY/CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY/$CI_PROJECT_PATH --all-tags
+
+# Stage: deploy
+load-deploy-dev:
+  rules: *main-job-rules
+  stage: deploy
+  variables:
+    ENVIRONMENT: dev
+  allow_failure: false
+  trigger:
+    include: ci/base-deploy.yml
+    strategy: depend
+
+load-deploy-qa:
+  rules: *main-job-rules
+  when: manual
+  stage: deploy-protected
+  needs:
+    - load-deploy-dev
+  variables:
+    ENVIRONMENT: qa
+  allow_failure: false
+  trigger:
+    include: ci/base-deploy-yml
+    strategy: depend
+
+load-deploy-stage:
+  rules: *main-job-rules
+  when: manual
+  stage: deploy-protected
+  needs:
+    - load-deploy-qa
+  variables:
+    ENVIRONMENT: stage
+  allow_failure: false
+  trigger:
+    include: ci/base-deploy.yml
+    strategy: depend
+
+# Note: The current db migration job uses the migrations folder populated
+# We will only allow prod to deploy after a successful stage deployment
+
+load-deploy-prod:
+  rules: *main-job-rules
+  when: manual
+  stage: deploy-protected
+  needs:
+    - load-deploy-stage
+  variables:
+    ENVIRONMENT: prod
+  allow_failure: false
+  trigger:
+    include: ci/prod-deploy.yml
+    strategy: depend

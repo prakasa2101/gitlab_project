@@ -1,0 +1,231 @@
+#!/bin/bash
+
+## Dynamic job generation script
+## Uses configs:
+## - in config/<image_name>/config.json   -> image settings
+
+cat <<EOT >> dynamic_pipeline.yml
+
+stages:
+  - Build Image
+  - Scan Image
+  - Push Image
+  - Post Script
+
+.parallel_config:
+  parallel:
+    matrix:
+      - AWS_ACCOUNT: [`echo $AWS_ACCOUNTS | tr ' ' ', '`]
+
+
+EOT
+
+if [ "$FORCE_REBUILD" != '' ]; then
+  echo "$FORCE_REBUILD" | tr ' ' '\n' | while read i; do echo "configs/$i/" >> file_list.lst ; done
+fi 
+
+if [ -s file_list.lst ]; then 
+
+  for images in `cat file_list.lst`
+  do 
+    image_name=$(echo $images |cut -d "/" -f 2)
+    image_path=$(echo $images |cut -d "/" -f -2)
+
+    if [ -f $image_path/config.json ] ; then
+      image_tag=$(jq -r .image_tag $image_path/config.json)
+      post_script=$(jq -r .post_script $image_path/config.json)
+      post_image=$(jq -r .post_image $image_path/config.json) 
+      scanner_exception=$(jq -r .scanner_exception $image_path/config.json)
+      dockle_options=$(jq -r .dockle_options $image_path/config.json)
+    fi
+     
+    if [ $scanner_exception == "true" ] ; then
+       exception=""
+    else
+       exception='--fail-on critical'
+    fi
+
+    if [ $dockle_options == "null" ] ; then
+       dockle_options=""
+    fi
+
+     cat <<EOT >> dynamic_pipeline.yml
+
+build-$image_name-$image_tag:
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  stage: Build Image
+  tags:
+    - $BUILD_TAG
+    - \$AWS_ACCOUNT
+  parallel: !reference [.parallel_config, parallel]  
+  allow_failure: false
+  cache:
+    key: cache-$CI_PIPELINE_ID-$image_name-$image_tag-$CI_COMMIT_REF_NAME-\$AWS_ACCOUNT
+    paths:
+      - local_data/
+  script:
+     - mkdir local_data
+     - /kaniko/executor --context $image_path --dockerfile $image_path/Dockerfile --cache-dir cache/image --tarPath local_data/image.tar --no-push --destination image
+  rules:
+    - if: \$FIRST_RUN == "true"
+      when: never
+    - when: always
+
+EOT
+
+  for AWS_ACCOUNT in $AWS_ACCOUNTS
+  do 
+
+  cat <<EOT >> dynamic_pipeline.yml
+
+scan-$image_name-$image_tag-$AWS_ACCOUNT:
+  stage: Scan Image
+  tags:
+    - $BUILD_TAG
+    - $AWS_ACCOUNT
+  allow_failure: false
+  cache:
+    - key: cache-$CI_PIPELINE_ID-$image_name-$image_tag-$CI_COMMIT_REF_NAME-$AWS_ACCOUNT
+      paths:
+      - local_data/
+    - key: $REPORTS_CACHE
+      paths:
+      - ScanReports/      
+  image:
+    name: ${SCANNER_IMAGE}
+  script:
+    - mkdir -p ScanReports
+    # Trivy - build report only
+    - trivy image --clear-cache && trivy --cache-dir .trivycache/ image --ignore-unfixed --no-progress --exit-code 0  --format template --template "@/usr/local/share/trivy/templates/junit.tpl" -o ScanReports/${image_name}_trivy-scanning-report.xml --input local_data/image.tar --timeout 10m
+    - trivy image --clear-cache && trivy --cache-dir .trivycache/ image --ignore-unfixed --no-progress --exit-code 0  --format template --template "@/usr/local/share/trivy/templates/gitlab.tpl" -o ScanReports/${image_name}_trivy-scanning-report.json --input local_data/image.tar --timeout 10m    
+    # # Trivy - Stop pipeline for HIGH and CRITICAL vulnerability
+    - trivy image --clear-cache && trivy --cache-dir .trivycache/ image --ignore-unfixed --no-progress --exit-code 0 --severity CRITICAL  --input local_data/image.tar --timeout 10m
+    # # Grype - Stop pipeline for HIGH and CRITICAL vulnerability
+    # - grype local_data/image.tar --only-fixed $exception --file ScanReports/grype-scanning-report.txt --output table --add-cpes-if-none
+    # # Dockle
+    # - dockle --input local_data/image.tar --exit-code 1 -i CIS-DI-0009 --exit-level fatal $dockle_options --output ScanReports/dockle-scanning-report.txt
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - ScanReports
+    reports:
+      junit: ScanReports/${image_name}_trivy-scanning-report.xml
+      container_scanning: ScanReports/${image_name}_trivy-scanning-report.json
+  needs:
+    - job: build-$image_name-$image_tag
+      parallel:
+        matrix:
+          - stage: ["$AWS_ACCOUNT"]
+  rules:
+    - if: \$FIRST_RUN == "true"
+      when: never
+    - when: on_success
+
+
+push-$image_name-$image_tag-$AWS_ACCOUNT:
+  image: ${BUILD_IMAGE_GITLAB}
+  stage: Push Image
+  tags:
+    - $BUILD_TAG
+    - $AWS_ACCOUNT
+  cache:
+    key: cache-$CI_PIPELINE_ID-$image_name-$image_tag-$CI_COMMIT_REF_NAME-$AWS_ACCOUNT
+    policy: pull
+    paths:
+      - local_data/
+  variables:    
+    IMAGE_TAG_COMMIT: $image_name:$image_tag    
+  needs:
+    - scan-$image_name-$image_tag-$AWS_ACCOUNT
+  script:
+    - echo "Push to AWS ECR"
+    - eval \$(aws sts assume-role --role-arn arn:aws:iam::\$(aws sts get-caller-identity --query Account --output text):role/terraform-executor --role-session-name image-bakery-\${AWS_ACCOUNT^^} | jq -r '.Credentials | "export AWS_ACCESS_KEY_ID=\(.AccessKeyId)\nexport AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)\nexport AWS_SESSION_TOKEN=\(.SessionToken)\n"')
+    - ECR_REPOSITORY_URI=\$(aws ecr describe-repositories --repository-name $image_name --region us-east-1 --query 'repositories[0].repositoryUri' | sed 's/\(\/$image_name\|\"\)//g')
+    - crane auth login -u "AWS" -p \$(aws ecr get-login-password --region us-east-1) \$ECR_REPOSITORY_URI
+    - echo "push image \$ECR_REPOSITORY_URI/\$IMAGE_TAG_COMMIT"
+    - crane push local_data/image.tar \$ECR_REPOSITORY_URI/\$IMAGE_TAG_COMMIT
+    - echo "Push to Gitlab Registry"
+    - crane auth login -u \$CI_REGISTRY_USER -p \$CI_REGISTRY_PASSWORD \$CI_REGISTRY
+    - if crane ls $CI_REGISTRY_IMAGE/$image_name |grep -q $image_tag ; then echo "Image TAG already exist" && exit 0 ;fi
+    - crane push local_data/image.tar $CI_REGISTRY_IMAGE/$image_name:$image_tag
+    - crane tag $CI_REGISTRY_IMAGE/$image_name:$image_tag latest
+  rules:
+    - if: \$FIRST_RUN == "true"
+      when: never
+    - when: manual
+
+EOT
+
+  done
+
+
+# if [ $post_script != "null" ] ; then
+
+#   cat <<EOT >> dynamic_pipeline.yml
+
+# post-$image_name-$image_tag-$CI_COMMIT_REF_NAME:
+#   image:
+#     name: $post_image
+#     entrypoint: [""]
+#   stage: Post Script
+#   tags:
+#     - $BUILD_TAG
+#   cache:
+#     key: cache-$CI_PIPELINE_ID-$image_name-$image_tag-$CI_COMMIT_REF_NAME
+#     policy: pull
+#     paths:
+#       - local_data/
+#   needs:
+#     - push-$image_name-$image_tag-$CI_COMMIT_REF_NAME
+#   script:
+#     - ./$image_path/post_script.sh
+#   rules:
+#     - if: \$CI_COMMIT_REF_NAME == \$CI_DEFAULT_BRANCH
+#       when: on_success
+
+# EOT
+# fi
+
+  done
+
+cat <<EOT >> dynamic_pipeline.yml
+
+build-initial_image_scanner-latest-$CI_COMMIT_REF_NAME:
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  stage: Build Image
+  tags:
+    - $BUILD_TAG
+  when: manual
+  allow_failure: false
+  script:
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"\$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor --context configs/image_scanner --dockerfile configs/image_scanner/Dockerfile --destination $CI_REGISTRY_IMAGE/image_scanner:latest
+  rules:
+    - if: \$FIRST_RUN == "true"
+      when: manual
+    - when: never
+
+EOT
+
+else
+
+cat <<EOT >> dynamic_pipeline.yml
+nothing-to-do:
+  stage: Build Image
+  script:
+    - echo "Nothing to do..."
+  image: 
+    name: alpine
+  tags:
+    - $BUILD_TAG
+  rules:
+    - if: \$CI_MERGE_REQUEST_ID
+
+EOT
+
+fi

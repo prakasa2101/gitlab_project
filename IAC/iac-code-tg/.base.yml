@@ -1,0 +1,79 @@
+# Base values and templates
+
+
+### Common setup
+
+
+# Parallel set for Stages/Environments
+.parallel_config_stages:
+  parallel:
+    matrix:
+      - AWS_ACCOUNT: [dev]
+
+.tags:
+  tags:
+     - $AWS_ACCOUNT  
+     - $IAC_RUNNER 
+
+
+.pre_rules:
+  rules:
+    - if: ($CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")
+      when: always
+      changes:
+        - live/**/*
+        - tf-modules/**/*
+        - modules/**/*        
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'   
+      when: always
+      changes:
+        - live/**/*
+        - tf-modules/**/*
+        - modules/**/*        
+    # - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+    #   when: always
+
+
+.build_rules:
+  rules:
+    - if: ($CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")
+      when: on_success
+      changes:
+        - live/**/*
+        - tf-modules/**/*
+        - modules/**/*           
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'   
+      when: on_success
+      changes:
+        - live/**/*
+        - tf-modules/**/*
+        - modules/**/*        
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      when: on_success  
+
+.deploy_rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'   
+      when: on_success 
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      when: on_success
+      changes:
+        - live/**/*
+        - tf-modules/**/*
+        - modules/**/*  
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      when: never
+      changes:
+        - .base.yml
+        - .gitlab-ci.yml
+        - generateApply
+        - generateJobs
+        - generatePlans
+        - README.md                
+### Gitlab Worker Image template
+.worker_image:
+  image:
+    name: $$IAC_IMAGE_$AWS_ACCOUNT
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'

@@ -1,0 +1,204 @@
+## Initial pipeline to verify and deploy Terraform Code
+
+include:
+  - /.base.yml
+
+
+stages:
+  - Code Validation
+  - Terraform PLAN
+  - Terraform APPLY
+
+
+###
+# Terraform Docs
+###
+Terraform-Docs-FMT:
+  extends: 
+    - .tags
+    - .worker_image
+  stage: Code Validation
+  variables:
+    AWS_ACCOUNT: dev     
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+      variables:
+        BRANCH_NAME: ${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}
+      allow_failure: false
+  script:
+    - echo "Generate docs for all stages"
+    - terraform-docs markdown --recursive table --recursive-path=modules --output-file README.md --output-mode inject . 
+    - echo "Fix terraform formating for all stages"  
+    - terraform fmt -recursive .
+    - terragrunt hclfmt
+    - git config --global user.name "${GITLAB_USER_NAME}"
+    - git config --global user.email "${GITLAB_USER_EMAIL}"
+    - git add .
+    - git commit -am "Auto documentation update $CI_COMMIT_SHORT_SHA" || true
+    - git push https://$CI_PROJECT_NAME:$CI_PROJECT_TOKEN@gitlab.com/opt-med-tech/iac/iac-lambda.git "HEAD:${BRANCH_NAME}" -o ci.skip
+
+
+# ###
+# # Checkov Security Scanner
+# ###   
+# chekov-code-scan:
+#   stage: Code Validation
+#   allow_failure: true  
+#   tags:
+#     - $IAC_RUNNER  
+#   image:
+#     name: bridgecrew/checkov:latest
+#     entrypoint:
+#       - '/usr/bin/env'
+#       - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+#   rules:
+#     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+#       exists:
+#         - '**/*.hcl'
+#         - '**/*.json'
+#         - '**/*.tpl'
+#         - '**/*.tf'
+#   needs:
+#     - Terraform-Docs-FMT              
+#   script:
+#     - checkov -d . -o junitxml --download-external-modules false --quiet --soft-fail | tee checkov.test.xml
+#   artifacts:
+#     reports:
+#       junit: "checkov.test.xml"
+#     paths:
+#       - "checkov.test.xml"  
+
+
+###
+# Terraform Validate - all stages
+###
+Generate Validation Jobs:
+  extends: 
+    - .tags
+    - .worker_image
+    - .pre_rules
+  stage: Code Validation
+  variables:
+    AWS_ACCOUNT: dev  
+  allow_failure: false
+  script:
+    - chmod +x generateJobs
+    - ./generateJobs
+  artifacts:
+    paths:
+      - dynamic_*.yml
+    expire_in: 1 hours
+  needs:
+    - job: Terraform-Docs-FMT
+      optional: true 
+
+
+###
+# Load Validation Jobs / per  stages
+###
+Validate:
+  extends:
+    - .pre_rules
+  stage: Code Validation
+  parallel: !reference [.parallel_config_stages, parallel]
+  allow_failure: false
+  trigger:
+    include:
+      - artifact: dynamic_$AWS_ACCOUNT.yml
+        job: Generate Validation Jobs
+    strategy: depend
+  variables:
+    CI_PARENT_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
+    CI_PARENT_COMMIT_REF_NAME: $CI_COMMIT_REF_NAME
+    CI_PARENT_MERGE_REQUEST_TARGET_BRANCH_NAME: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+  needs:
+    - Generate Validation Jobs
+  
+
+###
+# Terraform PLAN - all stages
+###
+Generate PLAN Jobs:
+  extends: 
+    - .tags
+    - .worker_image
+    - .build_rules
+  stage: Terraform PLAN
+  variables:
+    AWS_ACCOUNT: dev  
+  allow_failure: false
+  script:
+    - chmod +x generatePlans
+    - ./generatePlans
+  artifacts:
+    paths:
+      - dynamic_plan_*.yml
+    expire_in: 1 hours    
+
+
+###
+# Load PLAN Jobs / per  stages
+###
+Load PLAN:
+  extends: 
+    - .build_rules
+  stage: Terraform PLAN
+  parallel: !reference [.parallel_config_stages, parallel]
+  trigger:
+    include:
+      - artifact: dynamic_plan_$AWS_ACCOUNT.yml
+        job: Generate PLAN Jobs
+    strategy: depend
+  variables:
+    CI_PARENT_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
+    CI_PARENT_COMMIT_REF_NAME: $CI_COMMIT_REF_NAME
+    CI_PARENT_MERGE_REQUEST_TARGET_BRANCH_NAME: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+  needs:
+    - Generate PLAN Jobs
+ 
+
+###
+# Terraform APPLY - all stages
+###
+Generate APPLY Jobs:
+  extends: 
+    - .tags
+    - .deploy_rules  
+    - .worker_image
+  stage: Terraform APPLY
+  variables:
+    AWS_ACCOUNT: dev  
+  allow_failure: false
+  script:
+    - chmod +x generateApply
+    - ./generateApply
+  artifacts:
+    paths:
+      - dynamic_apply_*.yml
+    expire_in: 1 hours    
+
+    
+
+###
+# Load APPLY Jobs / per  stages
+###
+Load APPLY:
+  extends: 
+    - .deploy_rules  
+  stage: Terraform APPLY
+  parallel: !reference [.parallel_config_stages, parallel]
+  trigger:
+    include:
+      - artifact: dynamic_apply_$AWS_ACCOUNT.yml
+        job: Generate APPLY Jobs
+    strategy: depend
+  variables:
+    CI_PARENT_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
+    CI_PARENT_COMMIT_REF_NAME: $CI_COMMIT_REF_NAME
+    CI_PARENT_MERGE_REQUEST_TARGET_BRANCH_NAME: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+  needs:
+    - Generate APPLY Jobs
+
+      
+
+

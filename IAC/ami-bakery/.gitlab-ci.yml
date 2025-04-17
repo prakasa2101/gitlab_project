@@ -1,0 +1,75 @@
+image:
+  name: ${RUNNER_IMAGE_dev}
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+stages:
+  - Validate
+  - Build
+
+
+.aws-dev:
+  variables:
+    PKR_VAR_vpc_id: "vpc-0ca0e44660e7491c88"                 # opt-ct-dev 
+    PKR_VAR_subnet_id: "subnet-0f2861b7f5566b5300"           # private subnet
+    PKR_VAR_security_group_id: "sg-0db39a1f7bf2a8dd11"       # autoscaler_gitlab_runner_security_group
+
+
+.validate_rules:
+  rules:
+    - if: ($CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")
+      changes:
+        - packer/**/*
+      when: always       
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'   
+      when: always       
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      when: always
+
+.build_rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'   
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      when: manual
+
+
+
+### DEV
+Validate Packer DEV:
+  stage: Validate
+  tags:
+    - dev 
+    - $AMI_RUNNER 
+  extends:
+    - .aws-dev
+    - .validate_rules
+  script:
+    - echo "Validate AMi image for GitLab runner in DEV"
+    - cd packer
+    - packer init .
+    - packer validate .
+
+Build Runner AMI:
+  stage: Build
+  tags:
+    - $AWS_ACCOUNT 
+    - $AMI_RUNNER
+  extends:
+    - .aws-dev
+    - .build_rules
+  variables:
+    AWS_ACCOUNT: dev        
+  before_script: 
+    - curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+    - dpkg -i session-manager-plugin.deb   
+    - eval $(aws sts assume-role --role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/terraform-executor --role-session-name terraform-run-${AWS_ACCOUNT}-$CI_PIPELINE_ID | jq -r '.Credentials | "export AWS_ACCESS_KEY_ID=\(.AccessKeyId)\nexport AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)\nexport AWS_SESSION_TOKEN=\(.SessionToken)\n"')
+  script:
+    - echo "Build AMi image for GitLab runner in DEV"
+    - cd packer  
+    - packer init .
+    - packer build .
+
+
+

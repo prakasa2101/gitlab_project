@@ -1,0 +1,76 @@
+#docker image builder based on kaniko
+#maintainer: john.karendys@optctblox.com
+
+image:
+  name: ${BUILD_IMAGE_GITLAB}
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+stages:
+  - Setup And Load
+
+cache:
+  key: cache-artifacts-$CI_PIPELINE_ID
+  paths:
+    - ScanReports/
+
+variables:
+  FORCE_REBUILD: "" 
+  AWS_ACCOUNTS: "dev"
+
+Generate Configs:
+  allow_failure: false
+  tags:
+    - $BUILD_TAG
+  stage: Setup And Load
+  variables:
+    REPORTS_CACHE: cache-artifacts-$CI_PIPELINE_ID
+  cache: []
+  script:
+    - chmod +x ./generate-configs
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    - git diff --name-only origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME |grep "configs/" |sed 's:[^/]*$::'| sort -u  > file_list.lst || true
+    - ./generate-configs
+  artifacts:
+    paths:
+      - dynamic_pipeline.yml
+      - file_list.lst
+    expire_in: 12 hours
+  rules:
+    - if: ($CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")
+    - if: ( $FORCE_REBUILD != '' && $CI_PIPELINE_SOURCE == "web")
+
+
+Load Jobs:
+  stage: Setup And Load
+  trigger:
+    include:
+      - artifact: dynamic_pipeline.yml
+        job: Generate Configs
+    strategy: depend
+  variables:
+    CI_PARENT_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
+  needs:
+    - Generate Configs
+  rules:
+    - if: ($CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")
+    - if: ( $FORCE_REBUILD != '' && $CI_PIPELINE_SOURCE == "web")
+
+
+Gather and Expose Scaner Reports:
+  tags:
+    - $BUILD_TAG
+  stage: Setup And Load
+  script:
+    - echo "Gather and push scaner reports"
+  artifacts:
+    reports:
+      junit: ScanReports/*.xml
+      container_scanning: ScanReports/*.json      
+  needs: 
+   - Load Jobs
+  rules:
+    - if: ($CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")
+    - if: ( $FORCE_REBUILD != '' && $CI_PIPELINE_SOURCE == "web")
+

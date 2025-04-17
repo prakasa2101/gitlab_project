@@ -1,0 +1,18 @@
+variables:
+  NAMESPACE: pit-portal-backend
+  AGENT_SUFFIX: agent-backend
+  DEPLOYMENT: pit-portal-backend
+  RELEASE: pit-portal-backend
+ 
+.helm-kubectl-image:
+  image:
+    name: dtzar/helm-kubectl:3.15.3
+    entrypoint: ['']
+ 
+.k8-template:
+  extends:
+    - .helm-kubectl-image
+  before_script:
+    - kubectl config get-contexts
+    - kubectl config use-context prakasa-med-tech/gitlab-agents:$NAMESPACE-$ENVIRONMENT-$AGENT_SUFFIX
+    - kubectl config set-context --current --namespace=$NAMESPACE

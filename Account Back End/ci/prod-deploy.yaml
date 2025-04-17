@@ -1,0 +1,78 @@
+include:
+  - ci/base-deploy.yml
+ 
+stages:
+  - approval
+  - tag
+  - db-deploy
+  - deploy
+ 
+get-stage-deployment-sha:
+  stage: tag
+  extends:
+    - .helm-kubectl-image
+  artifacts:
+    paths:
+      - .stage-sha
+  script:
+    - kubectl config get-contexts
+    - kubectl config use-context Prakasha-med-tech/gitlab-agents:$NAMESPACE-stage-$AGENT_SUFFIX
+    - kubectl config set-context --current --namespace=$NAMESPACE
+    - STAGE_COMMIT_SHA=$(kubectl get deployments pit-portal-backend -o jsonpath="{.spec.template.metadata.labels['git-sha']}")
+    - echo "$STAGE_COMMIT_SHA" | tee .stage-sha
+ 
+promote-image-tags-prod:
+  stage: tag
+  image: docker:latest
+  services:
+    - docker:dind
+  artifacts:
+    paths:
+      - .release-tag
+  needs:
+    - job: get-stage-deployment-sha
+      artifacts: true
+  variables:
+    GITLAB_REPO_USERNAME: ci_push_token
+  script:
+    - STAGE_COMMIT_SHA=$(cat .stage-sha)
+    - RELEASE_TAG="release-$(date +%Y%m%d-%H%M%S)"
+    - echo "$RELEASE_TAG" | tee .release-tag
+ 
+    - echo "creating release - $RELEASE_TAG for $STAGE_COMMIT_SHA"
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker pull $CI_REGISTRY/$CI_PROJECT_PATH:$STAGE_COMMIT_SHA
+    - docker image tag $CI_REGISTRY/$CI_PROJECT_PATH:$STAGE_COMMIT_SHA $CI_REGISTRY/$CI_PROJECT_PATH:$RELEASE_TAG
+    - docker image tag $CI_REGISTRY/$CI_PROJECT_PATH:$STAGE_COMMIT_SHA $CI_REGISTRY/$CI_PROJECT_PATH:prod
+    - docker push $CI_REGISTRY/$CI_PROJECT_PATH --all-tags
+ 
+    - git remote set-url --push origin "https://$GITLAB_REPO_USERNAME:$GITLAB_REPO_TOKEN@gitlab.com/$CI_PROJECT_PATH.git"
+    - git config user.email "ci@Prakashamedtech.com"
+    - git config user.name "Prakasha CI"
+    - git tag -a "$RELEASE_TAG" -m "Release $STAGE_COMMIT_SHA" $STAGE_COMMIT_SHA
+    - git push --tags
+    - echo "Tagging successful"
+ 
+deploy-prod:
+  stage: deploy
+  extends:
+    - .k8-template
+  needs:
+    - db-migrate
+    - job: get-stage-deployment-sha
+      artifacts: true
+    - job: promote-image-tags-prod
+      artifacts: true
+  variables:
+    ENVIRONMENT: $ENVIRONMENT
+  script:
+    - STAGE_COMMIT_SHA=$(cat .stage-sha)
+    - RELEASE_TAG=$(cat .release-tag)
+    - echo "Deploying $STAGE_COMMIT_SHA with $RELEASE_TAG"
+ 
+    - helm upgrade --install $RELEASE charts/$DEPLOYMENT
+      -f charts/$DEPLOYMENT/values-$ENVIRONMENT.yaml
+      --set metadata.gitSha=$STAGE_COMMIT_SHA
+      --set image.tag=$RELEASE_TAG
+    - kubectl rollout restart deployment $DEPLOYMENT
+    - kubectl rollout status deployment $DEPLOYMENT

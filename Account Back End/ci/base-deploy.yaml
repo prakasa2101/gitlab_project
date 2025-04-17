@@ -1,0 +1,77 @@
+include:
+  - ci/base.yml
+ 
+stages:
+  - approval
+  - tag
+  - db-deploy
+  - deploy
+ 
+workflow:
+  auto_cancel:
+    on_job_failure: none
+ 
+deploy-approval:
+  rules:
+    - if: $ENVIRONMENT == 'qa' || $ENVIRONMENT == 'stage' || $ENVIRONMENT == 'prod'
+  stage: approval
+  allow_failure: false
+  environment: $ENVIRONMENT
+  script:
+    - echo "Starting $ENVIRONMENT deployment"
+ 
+push-image-tags-qa:
+  rules:
+    - if: $ENVIRONMENT == 'qa'
+  stage: tag
+  image: docker:latest
+  services:
+    - docker:dind
+  script: &push-image-script
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker pull $CI_REGISTRY/$CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA
+    - docker image tag $CI_REGISTRY/$CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA $CI_REGISTRY/$CI_PROJECT_PATH:$ENVIRONMENT
+    - docker push $CI_REGISTRY/$CI_PROJECT_PATH --all-tags
+ 
+push-image-tags-stage:
+  rules:
+    - if: $ENVIRONMENT == 'stage'
+  stage: tag
+  image: docker:latest
+  services:
+    - docker:dind
+  script: *push-image-script
+ 
+# TODO: this needs to be updated, so that prod is not reliant on the pipeline triggered commit when executed
+db-migrate:
+  stage: db-deploy
+  extends:
+    - .k8-template
+  script:
+    - kubectl delete configmap migrations-config --ignore-not-found
+    - kubectl delete configmap atlas-config --ignore-not-found
+ 
+    - kubectl create configmap migrations-config --from-file=migrations
+    - kubectl create configmap atlas-config --from-file=atlas.hcl
+ 
+    - kubectl apply -f k8s/jobs/atlas_migrate_job.yaml
+    - kubectl wait --for=condition=complete job/atlas-migrate-job --timeout=300s
+    - kubectl logs job/atlas-migrate-job
+ 
+deploy:
+  rules:
+    - if: $ENVIRONMENT != 'prod'
+  stage: deploy
+  extends:
+    - .k8-template
+  needs:
+    - db-migrate
+  variables:
+    ENVIRONMENT: $ENVIRONMENT
+  script:
+    - helm upgrade --install $RELEASE charts/$DEPLOYMENT
+      -f charts/$DEPLOYMENT/values-$ENVIRONMENT.yaml
+      --set metadata.gitSha=$CI_COMMIT_SHORT_SHA
+      --set image.tag=$CI_COMMIT_SHORT_SHA
+    - kubectl rollout restart deployment $DEPLOYMENT
+    - kubectl rollout status deployment $DEPLOYMENT

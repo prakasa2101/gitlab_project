@@ -1,0 +1,72 @@
+# Base values and templates
+
+
+# Terraform common 
+.base:
+  tags:
+     - $AWS_ACCOUNT  
+     - $IAC_RUNNER
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_FORCE_HTTPS: "true"
+    GIT_SUBMODULE_UPDATE_FLAGS: --remote  
+  before_script:
+    - eval $(aws sts assume-role --role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/terraform-executor --role-session-name terraform-run-${AWS_ACCOUNT}-$CI_PIPELINE_ID | jq -r '.Credentials | "export AWS_ACCESS_KEY_ID=\(.AccessKeyId)\nexport AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)\nexport AWS_SESSION_TOKEN=\(.SessionToken)\n"')
+    - export TF_ROOT=${CI_PROJECT_DIR}/${AWS_ACCOUNT^^}
+    - cd $TF_ROOT
+    - terraform version    
+    - terraform init
+
+
+### PLAN template
+.plan_common:
+  script:
+    - terraform plan -out=${TF_ROOT}/plan.tfplan $TFLOCK
+    - terraform show --json ${TF_ROOT}/plan.tfplan | jq -r '([.resource_changes[]?.change.actions?]|flatten)|{"create":(map(select(.=="create"))|length),"update":(map(select(.=="update"))|length),"delete":(map(select(.=="delete"))|length)}' > ${TF_ROOT}/tfplan.json
+  artifacts:
+    name: "$CI_JOB_NAME"
+    paths:
+      - ${AWS_ACCOUNT^^}/plan.tfplan
+    reports:
+      terraform: ${AWS_ACCOUNT^^}/tfplan.json
+
+.plan:
+  stage: Terraform PLAN
+  extends:
+    - .base
+    - .plan_common
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      variables:
+        TFLOCK: -lock=false    
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        TFLOCK: -lock=false
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH' 
+      variables:
+        TFLOCK: -lock=false
+      allow_failure: false
+
+
+### APPLY template
+.apply:
+  stage: Terraform APPLY
+  extends:
+    - .base
+  script:
+    - terraform apply -auto-approve
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+      when: manual  
+      allow_failure: false
+
+### Gitlab Worker Image template
+.worker_image:
+  image:
+    name: $$IAC_IMAGE_$AWS_ACCOUNT
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'

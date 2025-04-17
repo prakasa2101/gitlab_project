@@ -1,0 +1,80 @@
+#!/bin/bash
+
+
+## Base variables
+AWS_ACCOUNTS=`ls -d live/* | sed 's/live\///g' | xargs`
+
+## Pipeline stages  
+for stage in $AWS_ACCOUNTS
+do
+    cat <<EOT >> dynamic_$stage.yml
+stages:
+  - Validate $stage
+
+### Gitlab Worker Image template
+.worker_image:
+  image:
+    name: \$\$IAC_IMAGE_\$AWS_ACCOUNT
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+### Validate template
+.validate_template:
+  extends: 
+    - .worker_image
+  tags:
+     - \$AWS_ACCOUNT 
+     - \$IAC_RUNNER
+  allow_failure: false     
+  before_script:    
+    - eval \$(aws sts assume-role --role-arn arn:aws:iam::\$(aws sts get-caller-identity --query Account --output text):role/terraform-executor --role-session-name terraform-run-\${AWS_ACCOUNT}-\$CI_PIPELINE_ID | jq -r '.Credentials | "export AWS_ACCESS_KEY_ID=\(.AccessKeyId)\nexport AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)\nexport AWS_SESSION_TOKEN=\(.SessionToken)\n"')
+  rules:
+    - if: \$CI_PARENT_PIPELINE_SOURCE == "merge_request_event" && \$CI_PARENT_MERGE_REQUEST_TARGET_BRANCH_NAME == \$CI_DEFAULT_BRANCH
+    - if: '\$CI_PARENT_PIPELINE_SOURCE == "web" && \$CI_PARENT_COMMIT_REF_NAME == \$CI_DEFAULT_BRANCH'   
+    - if: '\$CI_PARENT_PIPELINE_SOURCE == "push" && \$CI_PARENT_COMMIT_REF_NAME == \$CI_DEFAULT_BRANCH'
+
+EOT
+done
+
+
+## Loop over all stages
+for stage in $AWS_ACCOUNTS
+do
+
+    ENVIRONMENTS=`find live/$stage/  -maxdepth 1 -type d | xargs | sed "s/live\/${stage}\///g"`
+    for env in $ENVIRONMENTS
+    do        
+        TG_ROOT="live/$stage/$env"
+        LAYERS=`find $TG_ROOT -type f -name terragrunt.hcl -not -path "*.terragrunt-cache*" | xargs  -i sh -c 'd="{}"; echo  ${d%/*}'`
+
+        for layer in $LAYERS
+        do
+          echo "process $layer  ${layer##*/}" 
+
+cat <<EOT >> dynamic_$stage.yml
+
+Terraform-Validate-$env-${layer##*/}:
+  stage: Validate $stage
+  extends: 
+    - .validate_template
+  variables:
+    AWS_ACCOUNT: $stage
+    TF_ROOT: \${CI_PROJECT_DIR}/${layer}/
+  script:
+    - echo "Validate ${layer##*/} in \${TF_ROOT}" 
+    - cd \${TF_ROOT}
+    - terragrunt init
+    - terragrunt validate 
+
+EOT
+
+        done
+    done
+done
+
+
+
+
+
+
